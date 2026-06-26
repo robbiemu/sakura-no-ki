@@ -15,17 +15,18 @@ documented behavior), or `[NOT TESTED]`.
 
 The first report concluded that a single `INTO OUTFILE` over a large table buffers
 catastrophically (4.3 GB RSS for 10M rows) and recommended forced windowed exports.
-**This follow-up overturns that conclusion**: the buffering is controllable via two
-Parquet-writer settings, and with them a single export is memory-bounded (~200 MB
-regardless of table size). Windowed sharding is still valuable — for completeness,
-parallelism, and restart-safety — but it is no longer a hard memory constraint.
+**This follow-up partially overturns that conclusion**: at the tested scale (≤ 10M rows /
+~480 MB live), two Parquet-writer settings bound memory to ~200–325 MB. Whether this bound
+holds at multi-GB live sizes is **not tested** (see §1 and the 8 GiB note below). Windowed
+sharding is still valuable — for completeness, restart-safety, and parallelism — and remains
+a reasonable belt-and-suspenders measure even though settings alone bounded memory in the test.
 
 | First report's claim | Follow-up finding |
 |---|---|
-| Single INTO OUTFILE buffers to 4.3 GB at 10M rows | **Solved by `max_threads=1` + `output_format_parquet_row_group_size=10000` → ~325 MB RSS** `[VERIFIED]` |
-| Forced windowed export is the answer | Settings suffice for memory; sharding is for completeness/restart, not memory |
-| Live export needs an admin endpoint (correct) | Confirmed; offline export is zero-mutation to source `[VERIFIED]` |
-| `_part`/`_part_offset` cursors untested | **Both available** `[VERIFIED]` — stable sharding cursors exist |
+| Single INTO OUTFILE buffers to 4.3 GB at 10M rows | **At the tested scale, bounded to ~325 MB by `max_threads=1` + `output_format_parquet_row_group_size=10000`** `[VERIFIED ≤10M rows]`. Multi-GB untested. |
+| Forced windowed export is the answer | Settings bounded memory in the test; sharding is for completeness/restart/parallelism, no longer a hard memory constraint at tested scale |
+| Live export needs an admin endpoint | Confirmed — **but only live export needs one**; offline export (the recommended v1 path) does not. Offline is zero-mutation to source `[VERIFIED]`. |
+| `_part`/`_part_offset` cursors untested | **Both available within one static snapshot** `[VERIFIED]`. They are **not** durable across merges/later runs — see §2 before relying on them as cross-run cursors. |
 | Rotation/catalog left open | 4 rotation models + 3 catalog options evaluated; recommendation below |
 
 ---
@@ -35,20 +36,20 @@ parallelism, and restart-safety — but it is no longer a hard memory constraint
 | Decision | Recommendation | Confidence | Tag |
 |---|---|---|---|
 | Export format | **Parquet** (9–36× compression, DuckDB predicate pushdown, types survive incl. Maps/arrays) | High | `[VERIFIED]` |
-| Export mechanism | `Chdb.query()` with `INTO OUTFILE` on a dedicated admin path; **never** `/local/query` (corrupts) or return-to-JS (buffers) | High | `[VERIFIED]` |
-| Memory bounding | `SETTINGS max_threads=1, output_format_parquet_row_group_size=10000` → ~200–325 MB RSS on all signal types incl. wide logs/histograms | High | `[VERIFIED]` |
-| Sharding strategy | Time-window primary (per UTC day); `_part`/`_part_offset` or TraceId-range as tiebreaker for pathological bursts at one timestamp | Medium | `[VERIFIED]` |
-| Source ownership (v1) | **Offline: stop Maple, open live dir directly** (zero source mutation, zero disk amplification) | High | `[VERIFIED]` |
-| Source ownership (v2) | Scratch-copy model (zero downtime, 1× disk amplification) — viable once copy includes the WHOLE data dir, not just `store/` | Medium | `[VERIFIED]` |
-| Rotation model | **Deferred — operator/product decision** (see §5). Recommend starting with Model A (fixed UTC-day, immutable) + delta chunks for late data | — | `[DOCUMENTED]` |
+| Export mechanism | `Chdb.query()` with `INTO OUTFILE`; **never** `/local/query` (corrupts) or return-to-JS (buffers). Offline export needs no admin endpoint; only live export does. | High | `[VERIFIED]` |
+| Memory bounding | `SETTINGS max_threads=1, output_format_parquet_row_group_size=10000` → ~200–325 MB RSS **at the tested scale (≤10M rows, ≤480 MB live)**, all signal types incl. wide logs/histograms | Medium (scale-bounded) | `[VERIFIED ≤10M]` |
+| Sharding strategy | Time-window primary (per UTC day); `_part`/`_part_offset` or per-row cursor as tiebreaker **within one snapshot** (not durable across merges — see §2) | Medium | `[VERIFIED]` |
+| Source ownership (v1) | **Offline: stop Maple, open live dir directly** (zero source mutation in test; needs sentinel checks — see §3) | High | `[VERIFIED]` |
+| Source ownership (v2) | Scratch-copy model — **only proven on a stopped store**; copying a *live* dir is unproven. Native checkpoint/restore is the safe copy mechanism. | Low (live unproven) | `[VERIFIED stopped only]` |
+| Rotation model | **Deferred — operator/product decision** (see §5). Dedup-by-TraceId is **invalid** (see §2) — duplicate handling needs a real dedup key or supersession. | — | `[DOCUMENTED]` |
 | Catalog | **Manifests as source of truth + `catalog.jsonl` as rebuildable index** (Option 1+2) | High | `[STATIC]` |
 | Hot pruning | v1: rely on existing TTLs. Explicit `prune-hot` is a separate policy, must enumerate raw + derived tables | High | `[VERIFIED]` |
-| Archive scope | 6 raw signal tables only; derived MV targets excluded (different TTLs, derivable) | High | `[STATIC]` |
+| Archive scope | Raw signal tables only; derived MV targets excluded (different TTLs, derivable). Session replay tables (`session_events`, `session_replay_events`, `session_replays`) exist and are a separate scope. | High | `[STATIC]` |
 
 **Questions requiring operator/product decisions** (not resolvable by research):
 1. Rotation model — A/B/C/D (§5). Trade-off is duplicate-handling vs. re-export cost vs. storage.
-2. Default chunk target size (the doc proposed 8 GiB; with bounded RSS this is now feasible in a single export, but operator tuning depends on archive-disk budget).
-3. Whether to ship live export (Model 3) or stay offline-only (Model 1) in v1.
+2. Default chunk target size — the doc proposed 8 GiB; the memory bound was only verified to ~480 MB live / 10M rows, so the 8 GiB target remains **extrapolated** until a multi-GB test is run.
+3. Whether live export (Model 3) is ever pursued — it is **out of scope for v1 and unvalidated**. The live-export loss measurement the task requested was not performed; it becomes mandatory if/when Model 3 is seriously considered.
 4. Whether pruning should ever be automatic or always operator-gated.
 
 ---
@@ -71,13 +72,13 @@ Tested at 10M rows (483 MB live, baseline single-export RSS 2,147 MB without ORD
 | `output_format_parquet_parallel_encoding=0` | errored (`Code: 722`) | — | wait-job deadlock in this build |
 
 **Decision: `SETTINGS max_threads=1, output_format_parquet_row_group_size=10000`.**
-Tradeoff: smaller row groups → slightly larger files (95 MB vs 57 MB) and ~6× slower (5s vs 0.8s at 10M), but memory-bounded. For a batch archive job, the latency is acceptable.
+Tradeoff: smaller row groups → slightly larger files (95 MB vs 57 MB) and ~6× slower (5s vs 0.8s at 10M), but at the tested scale memory is bounded. For a batch archive job, the latency is acceptable.
 
-### Wide data confirms it holds `[VERIFIED]`
+### Wide data confirms it holds `[VERIFIED ≤ tested scale]`
 
 Re-tested with 1M wide logs (large bodies + map attrs), 1M wide traces, 100k each of sum/gauge/histogram metrics — winning settings: **189–236 MB RSS across all signal types**, complex values survive (substring search in 1M wide bodies: 1M hits; map attr access: 1M hits).
 
-**This means a single export over a large table is now safe within a predictable memory budget (~200–325 MB). Multiple export queries are avoidable for memory reasons** — though sharding remains valuable for completeness, restart-safety, and parallelism (Task 2).
+**Scope of the claim:** these numbers are bounded at the tested scale (≤10M rows traces / ≤1M wide rows per table, ≤480 MB live). The settings dramatically reduce the writer's per-group accumulation, which *should* bound memory independent of table size — but multi-GB live stores were **not tested**, so the 8 GiB chunk target remains extrapolated. A multi-GB validation run is the natural follow-up before committing to single-export at that scale. Until then, sharding (Task 2) is still recommended as a belt-and-suspenders measure and for restart-safety.
 
 Script: [`experiments/archives/task1-memory-controls.ts`](../experiments/archives/task1-memory-controls.ts), [`task1b-wide.ts`](../experiments/archives/task1b-wide.ts).
 
@@ -94,22 +95,22 @@ Per-UTC-day export of an 800k-row store (3 days + a 500k-row pathological burst 
 
 ### Pathological burst (500k rows at one identical timestamp)
 
-A day-window covering the burst has 600k rows — too many for one shard if a lower limit is imposed. **Resolved by using a stable cursor tiebreaker**: split the day by `TraceId` range (or `_part`/`_part_offset`). The burst shard (TraceIds starting `burst…`) exported 500,000 rows; the normal shard 100,000; **sum = 600,000 ✓ COMPLETE**.
+A day-window covering the burst has 600k rows — too many for one shard if a lower limit is imposed. **Resolved by splitting the day by a per-row cursor** (`_part`/`_part_offset` within a single snapshot, or a synthetic value-range tiebreaker). The burst shard (TraceIds starting `burst…`) exported 500,000 rows; the normal shard 100,000; **sum = 600,000 ✓ COMPLETE**. Note the TraceId-range tiebreaker worked only because the synthetic data had distinct TraceIds — see the dedup caveat below.
 
-### Stable cursors available `[VERIFIED]`
+### Cursors available — within one static snapshot `[VERIFIED, with scope caveat]`
 
 - `_part` — yes, exposes part names (e.g. `20260625_1_1_0`). 5 parts in the test store.
 - `_part_offset` — yes, row offset within a part (range `0 → 499,999`).
 
-These are the preferred sharding cursors: they're stable, disjoint by construction (no duplicates), and align with chDB's physical layout (efficient scans). Time-window + `_part_offset` gives a complete, duplicate-free partitioning scheme.
+**Important scope:** `_part` and `_part_offset` are valid **within one static snapshot** (e.g. an offline export against a stopped store, or one scratch copy). They are **not durable across merges or across later runs** — a merge rewrites parts and invalidates both the names and the offsets. Any sharding scheme that resumes across runs must re-derive the cursor from the current snapshot's `system.parts`, never assume last run's `_part` values still hold.
 
 ### Completeness invariants (proven)
 
 - **sum(shard rows) == source rows** `[VERIFIED]`
-- **no duplicates:** `count(DISTINCT TraceId)` across all shards == total rows `[VERIFIED]`
+- **no duplicates within a single export:** the test confirmed `count(DISTINCT TraceId) == total` across shards — but **only because the synthetic data had unique TraceIds.** `[VERIFIED for unique-key data]`
 - **min/max timestamps** preserved across the union `[VERIFIED]`
 - **complex values** (maps, arrays) survive sharding `[VERIFIED]`
-- **interruption-restart:** shards are independent files; a re-run skips already-written shards (`if exists, continue`) `[STATIC]`
+- **interruption-restart:** shards are independent files, but **existence alone must not mean "skip"** — a shard file present from a crashed run may be partial or corrupt. Resume must re-validate each existing shard (row count vs source window, checksum, DuckDB-openable) before treating it as complete. `[STATIC]`
 
 ### Recommended limit
 
@@ -126,26 +127,27 @@ Script: [`experiments/archives/task2-sharding.ts`](../experiments/archives/task2
 | Model | Downtime | Disk amplification | Peak RSS | Failure behavior |
 |---|---|---|---|---|
 | **1. Stop Maple, open live dir** (offline) | full open+export window (~340ms test) | none (reads source, writes Parquet) | ~200 MB | dirty/incompatible store crashes chDB natively if sentinels aren't checked |
-| **2. Scratch-copy then export** | zero (server stays up) | 1× data-dir copy (~11 MB test) | ~200 MB | copy must include WHOLE data dir (`store/` alone is invalid) |
-| **3. Through running Maple** | zero server-downtime, full ingest-block | none | ~200 MB | needs admin endpoint that doesn't exist; `/local/query` corrupts OUTFILE |
+| **2. Copy store, export from copy** | **zero, IF the copy mechanism is crash-safe** | 1× data-dir copy (~11 MB test) | ~200 MB | see copy-safety caveat below |
+| **3. Through running Maple** | zero server-downtime, full ingest-block | none | ~200 MB | needs admin endpoint; **unvalidated, out of scope for v1** |
 
 ### Key findings
 
-- **Offline export (Model 1) is zero-mutation to the source** `[VERIFIED]`: reopening the store triggered no TTL work, no merges (parts stayed at 5), and `system.mutations` showed 0 pending after export. The export is purely a read.
-- **Model 2 must copy the whole data dir, not just `store/`** `[VERIFIED]`: a raw `cp -a store/` is an invalid chDB data dir (missing metadata/uuid); the copy must be `cp -a <dataDir>/. <scratch>/`. Alternatively, restore from a checkpoint (the checkpoint branch's mechanism).
-- **Model 3 is not directly testable** `[NOT TESTED]` — maple has no `INTO OUTFILE` admin endpoint. Architecturally it would block all ingest for the export duration (single chDB connection); OTLP clients retry.
+- **Offline export (Model 1) is zero-mutation to the source in the test** `[VERIFIED]`: reopening the stopped store triggered no TTL work, no merges (parts stayed at 5), and `system.mutations` showed 0 pending after export. The export is purely a read.
+- **Model 2's copy was only tested against a STOPPED store** `[VERIFIED stopped only]`. Copying a **live** data directory while Maple holds the chDB connection is **unproven** — a naive `cp -a` racing active merges/TTL can produce a torn, unopenable copy (the same risk documented for checkpoints in the prior research). The crash-safe path for Model 2 is **native checkpoint/restore** (proven round-trip in the checkpoint research), not a raw directory copy of a live store. Until live-copy is validated, Model 2 should either (a) stop Maple first, making it equivalent to Model 1 plus a copy, or (b) restore from a checkpoint.
+- **A raw `cp -a store/` is invalid even on a stopped store** `[VERIFIED]`: chDB needs the whole data dir (`store/` + metadata + uuid). Use `cp -a <dataDir>/. <scratch>/`.
+- **Model 3 is out of scope for v1 and unvalidated** `[NOT TESTED]` — see the loss-measurement note below.
 
 ### Failure-mode handling `[VERIFIED]` + `[STATIC]`
 
-- **Maple still running:** the archive tool must refuse (or use Model 2/3). Opening a live store's data dir while Maple holds the chDB connection is undefined.
+- **Maple still running:** the archive tool must refuse to open the live data dir directly (Models 1/2-without-stop). Opening a live store's data dir while Maple holds the chDB connection is undefined. Model 3 (live, through the server) is the only live-safe path and it's unvalidated.
 - **Dirty store:** **the FFI does NOT check sentinels** `[VERIFIED]` — it opened a store with a stale `maple-store-open` sentinel without complaint. The archive tool must check `maple-store-open` and `maple-store-version.json` itself (same guards as `maple start`), or risk a native crash on an inconsistent store.
 - **Incompatible chDB version:** refuse via the version marker check (same as `maple start`).
 - **Interrupted export:** partial `.parquet` stays in `building/`; DuckDB rejects it ("too small to be a Parquet file"); reconciler cleans up.
 - **Disk full:** `INTO OUTFILE` fails mid-write (`Code: 504`/ENOSPC); partial file + `building/` cleaned on next run.
 
-### Live export loss measurement `[NOT TESTED]`
+### Live export loss measurement — out of scope for v1 `[NOT TESTED, DEFERRED]`
 
-The task asked to "measure accepted vs dropped data, not infer losslessness from client retry." I did not run live OTLP ingest during a live export at production QPS (the admin endpoint doesn't exist, and my prior attempt hit OTLP/JSON encoder edge cases). **This remains an open item if Model 3 is pursued.**
+The task asked to "measure accepted vs dropped data, not infer losslessness from client retry." I did not perform this measurement. **Model 3 (live export) is out of scope for v1 consideration and unvalidated.** If/when live rotation is seriously considered, this measurement becomes mandatory: it requires a throwaway admin endpoint (running `INTO OUTFILE` on the server's connection), real concurrent OTLP ingest at production QPS during the export, and direct measurement of accepted vs. dropped/errored spans — not inference from retry behavior.
 
 Script: [`experiments/archives/task3-source-ownership.ts`](../experiments/archives/task3-source-ownership.ts).
 
@@ -172,7 +174,7 @@ All 6 archive tables round-trip cleanly through Parquet → DuckDB with complex 
 ### Tables out of scope `[STATIC]`
 
 - **Derived MV targets** (`error_events`, `trace_list_mv`, `logs_aggregates_hourly`, `service_overview_spans`, etc.): excluded — they're derived from raw tables, have intentionally different/shorter TTLs, and can be recomputed. Their row counts/time-ranges should be recorded in the manifest as validation evidence but they are not archived.
-- **Session replay data:** no such table exists in the current local schema. If added later, it would be a separate archive scope (likely large blob payloads, different retention).
+- **Session replay data — these tables DO exist** `[STATIC]`: `session_events`, `session_replay_events`, and `session_replays` are present in the schema. They are **out of scope for the first archive implementation** (likely large blob payloads, different retention characteristics, and a distinct query access pattern) but they are real tables that a complete archive story must eventually address. Calling them out explicitly so they aren't silently dropped.
 
 Script: [`experiments/archives/task4-coverage.ts`](../experiments/archives/task4-coverage.ts).
 
@@ -182,16 +184,26 @@ Script: [`experiments/archives/task4-coverage.ts`](../experiments/archives/task4
 
 ### The late-arrival duplicate risk, proven
 
-Archived a day (100k rows), then injected 10k late rows for the same day. Re-exported (Model A): scanning both files naively yields **210,000 rows (100k duplicates)**; `count(DISTINCT TraceId)` correctly yields 110,000. **Any rotation model must address this.**
+Archived a day (100k rows), then injected 10k late rows for the same day. Re-exported (Model A): scanning both files naively yields **210,000 rows (100k duplicates)**. **Any rotation model must address this.** (The earlier `count(DISTINCT TraceId)` "fix" in the first draft is **invalid as a general solution** — see the dedup-key caveat below.)
+
+### ⚠ Dedup-by-TraceId is NOT a valid dedup strategy
+
+The first draft of this report recommended "dedup by TraceId at query time." **That is wrong.** TraceId is not a unique row key across the archive scope:
+
+- **Traces** contain multiple spans — many rows share one TraceId. Deduping on TraceId collapses a trace to one span.
+- **Logs** may share a TraceId (a log attached to a span) or omit it entirely (logs have no required trace identity).
+- **Metrics** have no TraceId at all.
+
+`count(DISTINCT TraceId)` only happened to match the row count in the synthetic test because that test used one row per TraceId. **There is no single universal dedup key across all six archive tables.** Dedup, if needed, must use a true per-row identity (e.g. a composite of table + primary-sort-key columns + offset, or a content hash), not TraceId. The cleaner escape is to **avoid duplicates structurally** (Models B/C: disjoint shards by cursor, or supersession) rather than dedup-on-read.
 
 ### Four models evaluated
 
 | Model | Duplicate risk | Re-export cost | Storage | Complexity |
 |---|---|---|---|---|
-| **A. Fixed UTC-day, immutable** | high if re-exported + both scanned; mitigated by dedup-on-read | full re-export per supersession | 1× per generation | lowest |
-| **B. Size-targeted shards** | none if shards are disjoint by cursor (`_part_offset`/TraceId) | none (late data → new shard) | 1× | medium (catalog must track shards) |
-| **C. Immutable generations (supersession)** | none (queries read latest non-superseded) | full re-export per generation | 2× until GC | medium (supersede state) |
-| **D. Append-only delta chunks** | mitigated (UNION base+deltas, dedup by TraceId) | none | 1× + small deltas | medium (dedup-on-read or accept overlap) |
+| **A. Fixed UTC-day, immutable** | high if re-exported + both scanned; **no safe universal dedup key** → supersession (C) is the fix, not dedup-on-read | full re-export per supersession | 1× per generation | lowest |
+| **B. Size-targeted shards** | none if shards are disjoint by a per-row cursor (`_part`/`_part_offset` within one snapshot — not durable across merges, see §2) | none (late data → new shard) | 1× | medium (catalog must track shards, cursors must be re-derived per snapshot) |
+| **C. Immutable generations (supersession)** | none (queries read latest non-superseded generation) | full re-export per generation | 2× until GC | medium (supersede state) |
+| **D. Append-only delta chunks** | overlaps require dedup-on-read, but **there is no universal dedup key** (see above) — so D is only safe if deltas are guaranteed disjoint from base (e.g. by cursor) | none | 1× + small deltas | medium (disjointness must be enforced) |
 
 ### When a range becomes final `[DOCUMENTED]`
 
@@ -199,7 +211,7 @@ Hot TTLs: logs/traces 30d, metrics 90d. A range is safe to archive only after th
 
 ### Recommendation: defer to operator/product
 
-This is a product decision (duplicate-tolerance vs. re-export cost vs. storage). **Suggested starting point: Model A (fixed UTC-day, immutable) + Model D (delta chunks) for late arrivals**, with dedup-by-TraceId at query time. This is simplest to implement and the dedup cost is acceptable for forensic (infrequent) queries.
+This is a product decision (duplicate-tolerance vs. re-export cost vs. storage). **Suggested starting point: Model A (fixed UTC-day, immutable) + Model C (supersession) for late arrivals** — supersession avoids the dedup-key problem entirely by replacing, not unioning. Model D (delta) is viable only if delta disjointness is enforced by a per-row cursor; do **not** rely on TraceId-based dedup-on-read.
 
 Script: [`experiments/archives/task5-rotation.ts`](../experiments/archives/task5-rotation.ts).
 
@@ -250,30 +262,30 @@ Script: [`experiments/archives/task6-catalog.ts`](../experiments/archives/task6-
 
 ### Architecture A — "Offline minimal" (recommended starting point)
 
-- **Source:** stop Maple, open live dir directly (Model 1, Task 3).
-- **Export:** `INTO OUTFILE Parquet` with `max_threads=1, row_group_size=10000`, sharded by UTC day + `_part_offset` cursor (Tasks 1, 2).
-- **Rotation:** fixed UTC-day, immutable + delta chunks for late data; dedup-by-TraceId on read (Task 5 Model A+D).
+- **Source:** stop Maple, open live dir directly (Model 1, Task 3). Needs no admin endpoint.
+- **Export:** `INTO OUTFILE Parquet` with `max_threads=1, row_group_size=10000`, sharded by UTC day + a per-row cursor (`_part`/`_part_offset` **re-derived per snapshot**, since they're not durable across merges — Tasks 1, 2).
+- **Rotation:** fixed UTC-day, immutable + supersession for late data (Task 5 Model A+C). **Not** dedup-by-TraceId (invalid — see §5).
 - **Catalog:** manifests + `catalog.jsonl` (Task 6 Option 1+2).
 - **Pruning:** none in v1 (rely on TTLs).
-- **Tradeoff:** simplest, zero source mutation, but requires a Maple stop. Best for batch/nightly archiving.
+- **Tradeoff:** simplest, zero source mutation (in test), but requires a Maple stop. Best for batch/nightly archiving. Memory bounded at tested scale (≤10M rows); multi-GB untested.
 
-### Architecture B — "Zero-downtime via scratch copy"
+### Architecture B — "Checkpoint-restore source"
 
-- Same as A, but source = scratch copy of the whole data dir (Model 2, Task 3).
-- Maple stays up; the exporter works on the copy.
-- **Tradeoff:** zero downtime, but 1× disk amplification per archive run and the copy must capture the whole data dir. Best when Maple must stay online.
+- Same as A, but source = a **native checkpoint restore** into a scratch dir (the proven mechanism from the checkpoint research), not a raw `cp` of a live dir.
+- The live-store-copy variant of Model 2 is **unproven** (a naive `cp` racing merges is unsafe); only the stop-then-copy or checkpoint-restore paths are validated.
+- **Tradeoff:** avoids re-opening the live store, but still needs either a stop (for a safe copy) or a checkpoint, and adds 1× disk amplification. Best when you want the archive to run from a known-good restore point.
 
-### Architecture C — "Live admin endpoint" (future)
+### Architecture C — "Live admin endpoint" (out of scope for v1, unvalidated)
 
 - New admin endpoint (`POST /local/admin/archive`) calls `INTO OUTFILE` directly on the server's chDB connection (bypassing `forceJsonEachRow`).
-- **Tradeoff:** zero downtime, zero disk amplification, but blocks all ingest for the export duration and requires implementing + hardening the endpoint. Best for continuous/automated archiving once the endpoint exists.
+- **Status: unvalidated and out of scope for v1.** The live-export loss measurement (accepted vs dropped OTLP data during export) was not performed and becomes mandatory if this is seriously considered. Per architectural analysis it would block all ingest for the export duration.
 
 ### Recommended next discussion
 
 1. **Rotation model** — the team should pick A/B/C/D from Task 5. This is the highest-leverage product decision and blocks the catalog schema.
 2. **Source model for v1** — Architecture A (offline) vs B (scratch copy). A is simpler; B avoids downtime.
 3. **Default shard/chunk sizing** — confirm ~500k rows / ~256 MB uncompressed per shard, ~1 GiB Parquet per chunk.
-4. **Whether live export (Architecture C) is a v1 or v2 goal** — determines whether the admin-endpoint work is on the critical path.
+4. **Whether live export (Architecture C) is ever pursued** — it is out of scope for v1 and unvalidated; the loss measurement becomes mandatory if it's reconsidered. Not on the v1 critical path.
 
 **Do not begin the production implementation** until at least the rotation model is chosen — the catalog schema and the export orchestration both depend on it.
 
